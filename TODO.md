@@ -1,0 +1,5 @@
+- Add some logging to see where it's spending time
+- Retry with backoff for transient errors
+- CF/ASC MCPs?
+- Continue conversation in thread
+- Localize error message

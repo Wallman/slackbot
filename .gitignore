@@ -1,0 +1,8 @@
+.env
+keys/
+*.p8
+bot
+/bot
+.idea/
+.DS_Store
+*.iml
