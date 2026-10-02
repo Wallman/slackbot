@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
@@ -77,7 +78,9 @@ func handleEvents(
 				innerEvent := eventsAPIEvent.InnerEvent
 				switch ev := innerEvent.Data.(type) {
 				case *slackevents.AppMentionEvent:
-					go respond(api, llmClient, ascClient, cfClient, ascAppID, ev.Channel, ev.User, ev.Text)
+					receivedAt := time.Now()
+					log.Printf("[timing] received app_mention from user=%s channel=%s", ev.User, ev.Channel)
+					go respond(api, llmClient, ascClient, cfClient, ascAppID, ev.Channel, ev.User, ev.Text, receivedAt)
 				}
 			}
 		case socketmode.EventTypeConnecting:
@@ -95,6 +98,7 @@ func respond(
 	cfClient *cloudflare.Client,
 	ascAppID string,
 	channel, user, text string,
+	receivedAt time.Time,
 ) {
 	ctx := context.Background()
 	tools := availableTools()
@@ -106,7 +110,10 @@ func respond(
 
 	var reply string
 	for i := 0; i < maxToolIterations; i++ {
+		llmStart := time.Now()
 		result, err := llmClient.Complete(ctx, messages, tools)
+		log.Printf("[timing] LLM completion took %s (iteration=%d, tool_calls=%d, err=%v)",
+			time.Since(llmStart), i, len(result.ToolCalls), err)
 		if err != nil {
 			reply = fmt.Sprintf("Sorry <@%s>, I hit an error calling the LLM: %v", user, err)
 			break
@@ -122,7 +129,9 @@ func respond(
 		messages = append(messages, llm.Message{Role: "assistant", ToolCalls: result.ToolCalls})
 		for _, call := range result.ToolCalls {
 			log.Printf("[tool] calling %s(%s)", call.Function.Name, call.Function.Arguments)
+			toolStart := time.Now()
 			output := executeTool(ascClient, cfClient, ascAppID, call.Function.Name, call.Function.Arguments)
+			log.Printf("[timing] tool %s took %s", call.Function.Name, time.Since(toolStart))
 			messages = append(messages, llm.Message{
 				Role:       "tool",
 				ToolCallID: call.ID,
@@ -135,9 +144,12 @@ func respond(
 		}
 	}
 
+	postStart := time.Now()
 	if _, _, err := api.PostMessage(channel, slack.MsgOptionText(reply, false)); err != nil {
 		log.Printf("failed to post message: %v", err)
 	}
+	log.Printf("[timing] Slack post took %s", time.Since(postStart))
+	log.Printf("[timing] total time from mention to reply posted: %s", time.Since(receivedAt))
 }
 
 func availableTools() []llm.Tool {
@@ -178,7 +190,9 @@ func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client,
 		if ascAppID == "" {
 			return "error: ASC_APP_ID is not configured"
 		}
+		t0 := time.Now()
 		info, err := ascClient.GetAppInfo(ascAppID)
+		log.Printf("[timing] App Store Connect fetch took %s (err=%v)", time.Since(t0), err)
 		if err != nil {
 			return fmt.Sprintf("error fetching App Store Connect info: %v", err)
 		}
@@ -193,7 +207,9 @@ func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client,
 		if days <= 0 {
 			days = 7
 		}
+		t0 := time.Now()
 		data, err := cfClient.GetZoneRequestTotals(days)
+		log.Printf("[timing] Cloudflare fetch took %s (err=%v)", time.Since(t0), err)
 		if err != nil {
 			return fmt.Sprintf("error fetching Cloudflare traffic: %v", err)
 		}
