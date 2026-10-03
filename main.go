@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -16,10 +17,12 @@ import (
 	"slackbot/appstoreconnect"
 	"slackbot/cloudflare"
 	"slackbot/llm"
+	"slackbot/store"
 )
 
 const systemPrompt = `You are a helpful Slack bot assistant for a mobile app team.
-If a tool call fails or isn't relevant, answer from what you know and say plainly what data you lack.`
+If a tool call fails or isn't relevant, answer from what you know and say plainly what data you lack.
+Format your output using Slack syntax.`
 
 const maxToolIterations = 4
 
@@ -29,7 +32,19 @@ func main() {
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
 	orKey := mustEnv("OPENROUTER_API_KEY")
-	orModel := envOr("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+	orModel := envOr("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free")
+	dbURL := mustEnv("DATABASE_URL")
+
+	ctx := context.Background()
+
+	db, err := store.Open(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("failed to connect to postgres: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		log.Fatalf("failed to migrate postgres schema: %v", err)
+	}
 
 	ascClient := appstoreconnect.NewClient(
 		os.Getenv("ASC_ISSUER_ID"),
@@ -46,9 +61,17 @@ func main() {
 	llmClient := llm.NewClient(orKey, orModel)
 
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
+
+	authResp, err := api.AuthTest()
+	if err != nil {
+		log.Fatalf("slack auth test failed: %v", err)
+	}
+	botUserID := authResp.UserID
+	log.Printf("Authenticated as bot user %s", botUserID)
+
 	client := socketmode.New(api)
 
-	go handleEvents(client, api, llmClient, ascClient, cfClient, ascAppID)
+	go handleEvents(client, api, llmClient, ascClient, cfClient, db, ascAppID, botUserID)
 
 	log.Println("Starting Slack bot...")
 	if err := client.Run(); err != nil {
@@ -62,7 +85,8 @@ func handleEvents(
 	llmClient *llm.Client,
 	ascClient *appstoreconnect.Client,
 	cfClient *cloudflare.Client,
-	ascAppID string,
+	db *store.Store,
+	ascAppID, botUserID string,
 ) {
 	for event := range client.Events {
 		switch event.Type {
@@ -80,7 +104,39 @@ func handleEvents(
 				case *slackevents.AppMentionEvent:
 					receivedAt := time.Now()
 					log.Printf("[timing] received app_mention from user=%s channel=%s", ev.User, ev.Channel)
-					go respond(api, llmClient, ascClient, cfClient, ascAppID, ev.Channel, ev.User, ev.Text, receivedAt)
+					threadTS := ev.ThreadTimeStamp
+					if threadTS == "" {
+						threadTS = ev.TimeStamp // first message in a new thread
+					}
+					go respond(api, llmClient, ascClient, cfClient, db, ascAppID, ev.Channel, threadTS, ev.User, ev.Text, receivedAt)
+
+				case *slackevents.MessageEvent:
+					// Only consider plain replies inside an existing
+					// thread, from real users (not bots/ourselves), that
+					// don't already contain a mention (which app_mention
+					// above already handles - avoids double-processing the
+					// same message).
+					if ev.BotID != "" || ev.User == "" || ev.User == botUserID {
+						continue
+					}
+					if ev.ThreadTimeStamp == "" {
+						continue
+					}
+					if containsMention(ev.Text, botUserID) {
+						continue
+					}
+
+					receivedAt := time.Now()
+					known, err := db.IsKnownThread(context.Background(), ev.Channel, ev.ThreadTimeStamp)
+					if err != nil {
+						log.Printf("failed to check known thread: %v", err)
+						continue
+					}
+					if !known {
+						continue
+					}
+					log.Printf("[timing] received threaded reply from user=%s channel=%s thread=%s", ev.User, ev.Channel, ev.ThreadTimeStamp)
+					go respond(api, llmClient, ascClient, cfClient, db, ascAppID, ev.Channel, ev.ThreadTimeStamp, ev.User, ev.Text, receivedAt)
 				}
 			}
 		case socketmode.EventTypeConnecting:
@@ -91,22 +147,49 @@ func handleEvents(
 	}
 }
 
+// containsMention reports whether text contains a Slack mention of the
+// given user ID, e.g. "<@U123ABC>".
+func containsMention(text, userID string) bool {
+	if userID == "" {
+		return false
+	}
+	return strings.Contains(text, "<@"+userID+">")
+}
+
+// respond loads the thread's persisted history, appends the new user
+// message, runs the tool-calling conversation loop with the LLM, persists
+// the result, and posts the final answer back into the thread.
 func respond(
 	api *slack.Client,
 	llmClient *llm.Client,
 	ascClient *appstoreconnect.Client,
 	cfClient *cloudflare.Client,
+	db *store.Store,
 	ascAppID string,
-	channel, user, text string,
+	channel, threadTS, user, text string,
 	receivedAt time.Time,
 ) {
 	ctx := context.Background()
 	tools := availableTools()
 
-	messages := []llm.Message{
-		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: text},
+	if err := db.EnsureThread(ctx, channel, threadTS); err != nil {
+		log.Printf("failed to ensure thread: %v", err)
 	}
+
+	history, err := db.LoadHistory(ctx, channel, threadTS)
+	if err != nil {
+		log.Printf("failed to load thread history: %v", err)
+	}
+
+	userMsg := llm.Message{Role: "user", Content: text}
+	if err := db.AppendMessage(ctx, channel, threadTS, userMsg); err != nil {
+		log.Printf("failed to persist user message: %v", err)
+	}
+
+	messages := make([]llm.Message, 0, len(history)+2)
+	messages = append(messages, llm.Message{Role: "system", Content: systemPrompt})
+	messages = append(messages, history...)
+	messages = append(messages, userMsg)
 
 	var reply string
 	for i := 0; i < maxToolIterations; i++ {
@@ -115,37 +198,48 @@ func respond(
 		log.Printf("[timing] LLM completion took %s (iteration=%d, tool_calls=%d, err=%v)",
 			time.Since(llmStart), i, len(result.ToolCalls), err)
 		if err != nil {
-			reply = fmt.Sprintf("Sorry <@%s>, I hit an error calling the LLM: %v", user, err)
+			reply = fmt.Sprintf("Error: %v", err)
 			break
 		}
 
 		if len(result.ToolCalls) == 0 {
 			reply = result.Content
+			assistantMsg := llm.Message{Role: "assistant", Content: reply}
+			messages = append(messages, assistantMsg)
+			if err := db.AppendMessage(ctx, channel, threadTS, assistantMsg); err != nil {
+				log.Printf("failed to persist assistant message: %v", err)
+			}
 			break
 		}
 
 		// Record the assistant's tool-call request, then execute each tool
 		// and feed results back as "tool" messages before asking again.
-		messages = append(messages, llm.Message{Role: "assistant", ToolCalls: result.ToolCalls})
+		assistantMsg := llm.Message{Role: "assistant", ToolCalls: result.ToolCalls}
+		messages = append(messages, assistantMsg)
+		if err := db.AppendMessage(ctx, channel, threadTS, assistantMsg); err != nil {
+			log.Printf("failed to persist assistant tool-call message: %v", err)
+		}
+
 		for _, call := range result.ToolCalls {
 			log.Printf("[tool] calling %s(%s)", call.Function.Name, call.Function.Arguments)
 			toolStart := time.Now()
 			output := executeTool(ascClient, cfClient, ascAppID, call.Function.Name, call.Function.Arguments)
 			log.Printf("[timing] tool %s took %s", call.Function.Name, time.Since(toolStart))
-			messages = append(messages, llm.Message{
-				Role:       "tool",
-				ToolCallID: call.ID,
-				Content:    output,
-			})
+
+			toolMsg := llm.Message{Role: "tool", ToolCallID: call.ID, Content: output}
+			messages = append(messages, toolMsg)
+			if err := db.AppendMessage(ctx, channel, threadTS, toolMsg); err != nil {
+				log.Printf("failed to persist tool result message: %v", err)
+			}
 		}
 
 		if i == maxToolIterations-1 {
-			reply = "Sorry, I made too many tool calls trying to answer that without reaching a final answer."
+			reply = "Error: Too many tool calls."
 		}
 	}
 
 	postStart := time.Now()
-	if _, _, err := api.PostMessage(channel, slack.MsgOptionText(reply, false)); err != nil {
+	if _, _, err := api.PostMessage(channel, slack.MsgOptionText(reply, false), slack.MsgOptionTS(threadTS)); err != nil {
 		log.Printf("failed to post message: %v", err)
 	}
 	log.Printf("[timing] Slack post took %s", time.Since(postStart))

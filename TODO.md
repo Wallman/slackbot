@@ -1,3 +1,5 @@
+- If mentioned in unvisited thread, read whole thread
+- Trim conversation if context too large
+- More ASC data
+- Use RAG for something suitable
 - CF/ASC MCPs?
-- Continue conversation in thread
-- Localize error message

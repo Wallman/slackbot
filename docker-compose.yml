@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: slackbot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: slackbot
+      POSTGRES_PASSWORD: slackbot
+      POSTGRES_DB: slackbot
+    ports:
+      - "5432:5432"
+    volumes:
+      - slackbot-postgres-data:/var/lib/postgresql/data
+
+volumes:
+  slackbot-postgres-data:
