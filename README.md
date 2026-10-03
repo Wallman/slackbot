@@ -74,7 +74,8 @@ Then just reply in the thread (no need to @mention again) to continue the conver
   Reports* API returns gzipped TSV files
 - **Cloudflare**: currently pulls 7-day request/bytes/threats totals via the
   GraphQL Analytics API for `CF_ZONE_ID`.
-- **Context window**: thread history is sent to the LLM in full with no
-  trimming/token budgeting yet — fine for testing, but long threads will
-  eventually exceed the model's context window.
+- **Context window**: thread history is trimmed automatically once it
+  estimated-exceeds 80% of `MAX_CONTEXT_TOKENS`. Trimming drops the oldest
+  turns first (never splitting an assistant tool-call from its tool
+  result, and always keeping the system prompt), using `tiktoken-go` for token estimation.
 - Secrets are loaded from `.env` via `godotenv`; never commit `.env`.

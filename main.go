@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,15 +18,17 @@ import (
 
 	"slackbot/appstoreconnect"
 	"slackbot/cloudflare"
+	"slackbot/contextbudget"
 	"slackbot/llm"
 	"slackbot/store"
 )
 
-const systemPrompt = `You are a helpful Slack bot assistant for a mobile app team.
+const systemPrompt = `You are Svante, a helpful Slack bot assistant.
 If a tool call fails or isn't relevant, answer from what you know and say plainly what data you lack.
 Format your output using Slack syntax.`
 
 const maxToolIterations = 4
+const contextBudgetThreshold = 0.8
 
 func main() {
 	_ = godotenv.Load()
@@ -35,6 +38,7 @@ func main() {
 	orKey := mustEnv("OPENROUTER_API_KEY")
 	orModel := envOr("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free")
 	dbURL := mustEnv("DATABASE_URL")
+	maxContextTokens := envOrInt("MAX_CONTEXT_TOKENS", 32000)
 
 	ctx := context.Background()
 
@@ -73,7 +77,7 @@ func main() {
 	client := socketmode.New(api)
 	names := newUserNameCache()
 
-	go handleEvents(client, api, llmClient, ascClient, cfClient, db, names, ascAppID, botUserID)
+	go handleEvents(client, api, llmClient, ascClient, cfClient, db, names, ascAppID, botUserID, maxContextTokens)
 
 	log.Println("Starting Slack bot...")
 	if err := client.Run(); err != nil {
@@ -90,6 +94,7 @@ func handleEvents(
 	db *store.Store,
 	names *userNameCache,
 	ascAppID, botUserID string,
+	maxContextTokens int,
 ) {
 	for event := range client.Events {
 		switch event.Type {
@@ -111,7 +116,7 @@ func handleEvents(
 					if threadTS == "" {
 						threadTS = ev.TimeStamp // first message in a new thread
 					}
-					go respond(api, llmClient, ascClient, cfClient, db, names, ascAppID, ev.Channel, threadTS, ev.TimeStamp, ev.User, ev.Text, receivedAt)
+					go respond(api, llmClient, ascClient, cfClient, db, names, ascAppID, ev.Channel, threadTS, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
 
 				case *slackevents.MessageEvent:
 					// Only consider plain replies inside an existing
@@ -139,7 +144,7 @@ func handleEvents(
 						continue
 					}
 					log.Printf("[timing] received threaded reply from user=%s channel=%s thread=%s", ev.User, ev.Channel, ev.ThreadTimeStamp)
-					go respond(api, llmClient, ascClient, cfClient, db, names, ascAppID, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text, receivedAt)
+					go respond(api, llmClient, ascClient, cfClient, db, names, ascAppID, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
 				}
 			}
 		case socketmode.EventTypeConnecting:
@@ -172,6 +177,7 @@ func respond(
 	ascAppID string,
 	channel, threadTS, msgTS, user, text string,
 	receivedAt time.Time,
+	maxContextTokens int,
 ) {
 	ctx := context.Background()
 	tools := availableTools()
@@ -204,6 +210,13 @@ func respond(
 	messages = append(messages, llm.Message{Role: "system", Content: systemPrompt})
 	messages = append(messages, history...)
 	messages = append(messages, userMsg)
+
+	if before := contextbudget.EstimateTokens(messages); float64(before) > float64(maxContextTokens)*contextBudgetThreshold {
+		messages = contextbudget.Trim(messages, int(float64(maxContextTokens)*contextBudgetThreshold))
+		after := contextbudget.EstimateTokens(messages)
+		log.Printf("[context] trimmed thread %s/%s: %d -> %d estimated tokens (budget %d)",
+			channel, threadTS, before, after, maxContextTokens)
+	}
 
 	var reply string
 	for i := 0; i < maxToolIterations; i++ {
@@ -422,4 +435,17 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envOrInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("invalid integer for %s=%q, using default %d: %v", key, v, fallback, err)
+		return fallback
+	}
+	return n
 }
