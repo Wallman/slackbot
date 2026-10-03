@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -70,8 +71,9 @@ func main() {
 	log.Printf("Authenticated as bot user %s", botUserID)
 
 	client := socketmode.New(api)
+	names := newUserNameCache()
 
-	go handleEvents(client, api, llmClient, ascClient, cfClient, db, ascAppID, botUserID)
+	go handleEvents(client, api, llmClient, ascClient, cfClient, db, names, ascAppID, botUserID)
 
 	log.Println("Starting Slack bot...")
 	if err := client.Run(); err != nil {
@@ -86,6 +88,7 @@ func handleEvents(
 	ascClient *appstoreconnect.Client,
 	cfClient *cloudflare.Client,
 	db *store.Store,
+	names *userNameCache,
 	ascAppID, botUserID string,
 ) {
 	for event := range client.Events {
@@ -108,7 +111,7 @@ func handleEvents(
 					if threadTS == "" {
 						threadTS = ev.TimeStamp // first message in a new thread
 					}
-					go respond(api, llmClient, ascClient, cfClient, db, ascAppID, ev.Channel, threadTS, ev.User, ev.Text, receivedAt)
+					go respond(api, llmClient, ascClient, cfClient, db, names, ascAppID, ev.Channel, threadTS, ev.TimeStamp, ev.User, ev.Text, receivedAt)
 
 				case *slackevents.MessageEvent:
 					// Only consider plain replies inside an existing
@@ -136,7 +139,7 @@ func handleEvents(
 						continue
 					}
 					log.Printf("[timing] received threaded reply from user=%s channel=%s thread=%s", ev.User, ev.Channel, ev.ThreadTimeStamp)
-					go respond(api, llmClient, ascClient, cfClient, db, ascAppID, ev.Channel, ev.ThreadTimeStamp, ev.User, ev.Text, receivedAt)
+					go respond(api, llmClient, ascClient, cfClient, db, names, ascAppID, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text, receivedAt)
 				}
 			}
 		case socketmode.EventTypeConnecting:
@@ -165,15 +168,25 @@ func respond(
 	ascClient *appstoreconnect.Client,
 	cfClient *cloudflare.Client,
 	db *store.Store,
+	names *userNameCache,
 	ascAppID string,
-	channel, threadTS, user, text string,
+	channel, threadTS, msgTS, user, text string,
 	receivedAt time.Time,
 ) {
 	ctx := context.Background()
 	tools := availableTools()
 
+	known, err := db.IsKnownThread(ctx, channel, threadTS)
+	if err != nil {
+		log.Printf("failed to check known thread: %v", err)
+	}
+
 	if err := db.EnsureThread(ctx, channel, threadTS); err != nil {
 		log.Printf("failed to ensure thread: %v", err)
+	}
+
+	if !known {
+		backfillThreadHistory(ctx, api, db, names, channel, threadTS, msgTS)
 	}
 
 	history, err := db.LoadHistory(ctx, channel, threadTS)
@@ -181,7 +194,8 @@ func respond(
 		log.Printf("failed to load thread history: %v", err)
 	}
 
-	userMsg := llm.Message{Role: "user", Content: text}
+	authorName := names.resolveName(api, user)
+	userMsg := llm.Message{Role: "user", Content: fmt.Sprintf("%s: %s", authorName, text)}
 	if err := db.AppendMessage(ctx, channel, threadTS, userMsg); err != nil {
 		log.Printf("failed to persist user message: %v", err)
 	}
@@ -244,6 +258,80 @@ func respond(
 	}
 	log.Printf("[timing] Slack post took %s", time.Since(postStart))
 	log.Printf("[timing] total time from mention to reply posted: %s", time.Since(receivedAt))
+}
+
+func backfillThreadHistory(ctx context.Context, api *slack.Client, db *store.Store, names *userNameCache, channel, threadTS, currentMsgTS string) {
+	replies, _, _, err := api.GetConversationRepliesContext(ctx, &slack.GetConversationRepliesParameters{
+		ChannelID: channel,
+		Timestamp: threadTS,
+	})
+	if err != nil {
+		log.Printf("failed to fetch thread history for backfill: %v", err)
+		return
+	}
+
+	for _, m := range replies {
+		if m.Timestamp == currentMsgTS {
+			continue // this is the message that triggered respond(); it's added separately below
+		}
+		if m.Text == "" {
+			continue
+		}
+
+		var msg llm.Message
+		if m.BotID != "" {
+			// Treat prior bot messages as assistant turns, unprefixed.
+			msg = llm.Message{Role: "assistant", Content: m.Text}
+		} else {
+			authorName := names.resolveName(api, m.User)
+			msg = llm.Message{Role: "user", Content: fmt.Sprintf("%s: %s", authorName, m.Text)}
+		}
+		if err := db.AppendMessage(ctx, channel, threadTS, msg); err != nil {
+			log.Printf("failed to persist backfilled message: %v", err)
+		}
+	}
+}
+
+type userNameCache struct {
+	mu    sync.Mutex
+	names map[string]string
+}
+
+func newUserNameCache() *userNameCache {
+	return &userNameCache{names: make(map[string]string)}
+}
+
+func (c *userNameCache) resolveName(api *slack.Client, userID string) string {
+	if userID == "" {
+		return "someone"
+	}
+
+	c.mu.Lock()
+	if name, ok := c.names[userID]; ok {
+		c.mu.Unlock()
+		return name
+	}
+	c.mu.Unlock()
+
+	name := userID
+	info, err := api.GetUserInfo(userID)
+	if err != nil {
+		log.Printf("failed to resolve display name for %s: %v", userID, err)
+	} else {
+		switch {
+		case info.Profile.DisplayName != "":
+			name = info.Profile.DisplayName
+		case info.RealName != "":
+			name = info.RealName
+		case info.Name != "":
+			name = info.Name
+		}
+	}
+
+	c.mu.Lock()
+	c.names[userID] = name
+	c.mu.Unlock()
+	return name
 }
 
 func availableTools() []llm.Tool {

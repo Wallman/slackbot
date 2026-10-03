@@ -30,11 +30,19 @@ answer, which is posted back to Slack **inside a thread**.
   re-mentioning the bot** — the bot subscribes to plain `message` events and
   checks Postgres (`IsKnownThread`) to decide whether to respond, so it
   behaves like a normal participant once added to a thread.
+- If the bot is `@mentioned` inside a thread that already had prior
+  messages (i.e. it's being looped in mid-conversation), it fetches the
+  full thread via `conversations.replies` and backfills that history into
+  Postgres before responding, so it has context from before it joined.
+- Every stored/forwarded user message is tagged with the author's Slack
+  display name so the LLM can tell different people apart in a multi-person
+  thread. Display names are resolved via `users.info` and cached in memory.
+
 
 ## 1. Slack app setup (Socket Mode)
 You said you already have a Slack app — make sure it has:
 - **Socket Mode** enabled, with an **app-level token** (`xapp-...`) that has the `connections:write` scope
-- **Bot token scopes**: `app_mentions:read`, `chat:write`, `channels:history` (add `groups:history`/`im:history`/`mpim:history` too if the bot is used in private channels/DMs)
+- **Bot token scopes**: `app_mentions:read`, `chat:write`, `channels:history`, `users:read` (add `groups:history`/`im:history`/`mpim:history` too if the bot is used in private channels/DMs)
 - **Event Subscriptions** → subscribe to bot events `app_mention` and `message.channels` (+ `message.groups`/`message.im`/`message.mpim` as needed)
 - Install/reinstall the app to your workspace to get the **bot token** (`xoxb-...`)
 

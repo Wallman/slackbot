@@ -84,9 +84,6 @@ func (s *Store) EnsureThread(ctx context.Context, channel, threadTS string) erro
 	return nil
 }
 
-// IsKnownThread reports whether the bot is already participating in this
-// thread (i.e. it was @mentioned there before), used to decide whether to
-// respond to a plain reply that doesn't re-mention the bot.
 func (s *Store) IsKnownThread(ctx context.Context, channel, threadTS string) (bool, error) {
 	var exists bool
 	err := s.db.QueryRowContext(ctx, `
