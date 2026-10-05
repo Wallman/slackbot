@@ -4,12 +4,17 @@
 package appstoreconnect
 
 import (
+	"bufio"
+	"compress/gzip"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -111,4 +116,103 @@ func (c *Client) GetAppInfo(appID string) (string, error) {
 		return "", err
 	}
 	return string(body), nil
+}
+
+func (c *Client) getDailyDownloadCount(vendorNumber, appleID string, reportDate time.Time) (downloads int, found bool, err error) {
+	tok, err := c.token()
+	if err != nil {
+		return 0, false, fmt.Errorf("generate token: %w", err)
+	}
+
+	q := url.Values{}
+	q.Set("filter[reportType]", "SALES")
+	q.Set("filter[reportSubType]", "SUMMARY")
+	q.Set("filter[frequency]", "DAILY")
+	q.Set("filter[reportDate]", reportDate.Format("2006-01-02"))
+	q.Set("filter[vendorNumber]", vendorNumber)
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/salesReports?"+q.Encode(), nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Accept", "application/a-gzip")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return 0, false, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return 0, false, nil // report not generated yet for this date
+	}
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, false, fmt.Errorf("sales report error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return 0, false, fmt.Errorf("ungzip report: %w", err)
+	}
+	defer gz.Close()
+
+	var header []string
+	scanner := bufio.NewScanner(gz)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	colIndex := func(name string) int {
+		for i, h := range header {
+			if h == name {
+				return i
+			}
+		}
+		return -1
+	}
+	total := 0
+	for scanner.Scan() {
+		cols := strings.Split(scanner.Text(), "\t")
+		if header == nil {
+			header = cols
+			continue
+		}
+		appleIDIdx, unitsIdx := colIndex("Apple Identifier"), colIndex("Units")
+		productTypeIdx := colIndex("Product Type Identifier")
+		if appleIDIdx < 0 || unitsIdx < 0 || productTypeIdx < 0 || appleIDIdx >= len(cols) || cols[appleIDIdx] != appleID {
+			continue
+		}
+		switch cols[productTypeIdx] {
+		case "1", "1F": // paid/free app download — the only real "downloads"
+		default: // e.g. "3"/"3F" updates, "7"/"7F" in-app purchases
+			continue
+		}
+		units, _ := strconv.Atoi(cols[unitsIdx])
+		total += units
+		found = true
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, false, fmt.Errorf("read report: %w", err)
+	}
+	return total, found, nil
+}
+
+func (c *Client) GetDownloadsTrend(vendorNumber, appleID string, days int) (string, error) {
+	var sb strings.Builder
+	sb.WriteString("Date\tDownloads\n")
+
+	today := time.Now().UTC()
+	for i := days; i >= 1; i-- {
+		date := today.AddDate(0, 0, -i)
+		downloads, found, err := c.getDailyDownloadCount(vendorNumber, appleID, date)
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("%s\terror: %v\n", date.Format("2006-01-02"), err))
+			continue
+		}
+		if !found {
+			sb.WriteString(fmt.Sprintf("%s\tno data\n", date.Format("2006-01-02")))
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("%s\t%d\n", date.Format("2006-01-02"), downloads))
+	}
+	return sb.String(), nil
 }

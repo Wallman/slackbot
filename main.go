@@ -29,6 +29,8 @@ Format your output using Slack syntax.`
 
 const maxToolIterations = 4
 const contextBudgetThreshold = 0.8
+const fjallkartanAppleID = "6798425234"
+const ascVendorNumber = "85818328"
 
 func main() {
 	_ = godotenv.Load()
@@ -56,7 +58,6 @@ func main() {
 		os.Getenv("ASC_KEY_ID"),
 		os.Getenv("ASC_PRIVATE_KEY_PATH"),
 	)
-	ascAppID := os.Getenv("ASC_APP_ID")
 
 	cfClient := cloudflare.NewClient(
 		os.Getenv("CF_API_TOKEN"),
@@ -77,7 +78,7 @@ func main() {
 	client := socketmode.New(api)
 	names := newUserNameCache()
 
-	go handleEvents(client, api, llmClient, ascClient, cfClient, db, names, ascAppID, botUserID, maxContextTokens)
+	go handleEvents(client, api, llmClient, ascClient, cfClient, db, names, botUserID, maxContextTokens)
 
 	log.Println("Starting Slack bot...")
 	if err := client.Run(); err != nil {
@@ -93,7 +94,7 @@ func handleEvents(
 	cfClient *cloudflare.Client,
 	db *store.Store,
 	names *userNameCache,
-	ascAppID, botUserID string,
+	botUserID string,
 	maxContextTokens int,
 ) {
 	for event := range client.Events {
@@ -116,7 +117,7 @@ func handleEvents(
 					if threadTS == "" {
 						threadTS = ev.TimeStamp // first message in a new thread
 					}
-					go respond(api, llmClient, ascClient, cfClient, db, names, ascAppID, ev.Channel, threadTS, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
+					go respond(api, llmClient, ascClient, cfClient, db, names, ev.Channel, threadTS, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
 
 				case *slackevents.MessageEvent:
 					// Only consider plain replies inside an existing
@@ -144,7 +145,7 @@ func handleEvents(
 						continue
 					}
 					log.Printf("[timing] received threaded reply from user=%s channel=%s thread=%s", ev.User, ev.Channel, ev.ThreadTimeStamp)
-					go respond(api, llmClient, ascClient, cfClient, db, names, ascAppID, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
+					go respond(api, llmClient, ascClient, cfClient, db, names, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
 				}
 			}
 		case socketmode.EventTypeConnecting:
@@ -174,7 +175,6 @@ func respond(
 	cfClient *cloudflare.Client,
 	db *store.Store,
 	names *userNameCache,
-	ascAppID string,
 	channel, threadTS, msgTS, user, text string,
 	receivedAt time.Time,
 	maxContextTokens int,
@@ -250,7 +250,7 @@ func respond(
 		for _, call := range result.ToolCalls {
 			log.Printf("[tool] calling %s(%s)", call.Function.Name, call.Function.Arguments)
 			toolStart := time.Now()
-			output := executeTool(ascClient, cfClient, ascAppID, call.Function.Name, call.Function.Arguments)
+			output := executeTool(ascClient, cfClient, call.Function.Name, call.Function.Arguments)
 			log.Printf("[timing] tool %s took %s", call.Function.Name, time.Since(toolStart))
 
 			toolMsg := llm.Message{Role: "tool", ToolCallID: call.ID, Content: output}
@@ -352,11 +352,16 @@ func availableTools() []llm.Tool {
 		{
 			Type: "function",
 			Function: llm.ToolFunction{
-				Name:        "get_app_store_connect_info",
-				Description: "Fetch App Store Connect metadata (name, bundle ID, SKU, state, etc.) for the configured app. Use this for questions about the app's status, info, or sales/listing details.",
+				Name:        "get_app_downloads",
+				Description: "Fetch daily download counts for the Fjällkartan app over a recent period. Use this for questions about downloads or install trends for the app (it's a free app, so there is no sales/revenue data).",
 				Parameters: map[string]any{
-					"type":       "object",
-					"properties": map[string]any{},
+					"type": "object",
+					"properties": map[string]any{
+						"days": map[string]any{
+							"type":        "integer",
+							"description": "Number of trailing days to fetch (default 7).",
+						},
+					},
 				},
 			},
 		},
@@ -379,19 +384,24 @@ func availableTools() []llm.Tool {
 	}
 }
 
-func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client, ascAppID, name, argsJSON string) string {
+func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client, name, argsJSON string) string {
 	switch name {
-	case "get_app_store_connect_info":
-		if ascAppID == "" {
-			return "error: ASC_APP_ID is not configured"
+	case "get_app_downloads":
+		var args struct {
+			Days int `json:"days"`
+		}
+		_ = json.Unmarshal([]byte(argsJSON), &args) // ignore error: fall back to default below
+		days := args.Days
+		if days <= 0 {
+			days = 7
 		}
 		t0 := time.Now()
-		info, err := ascClient.GetAppInfo(ascAppID)
-		log.Printf("[timing] App Store Connect fetch took %s (err=%v)", time.Since(t0), err)
+		data, err := ascClient.GetDownloadsTrend(ascVendorNumber, fjallkartanAppleID, days)
+		log.Printf("[timing] App Store Connect downloads fetch took %s (err=%v)", time.Since(t0), err)
 		if err != nil {
-			return fmt.Sprintf("error fetching App Store Connect info: %v", err)
+			return fmt.Sprintf("error fetching App Store downloads: %v", err)
 		}
-		return truncate(info, 3000)
+		return truncate(data, 3000)
 
 	case "get_cloudflare_traffic":
 		var args struct {

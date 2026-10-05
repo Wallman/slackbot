@@ -1,8 +1,8 @@
 # Slackbot: App Store Connect + Cloudflare + LLM (OpenRouter, free tier)
 
 A Slack bot that answers questions in Slack by pulling live
-context from **App Store Connect** (app info) and **Cloudflare** (zone
-analytics), then asking a free LLM on **OpenRouter** to answer.
+context from **App Store Connect** (download trends) and **Cloudflare**
+(zone analytics), then asking a free LLM on **OpenRouter** to answer.
 
 ## Architecture
 - `main.go` — entrypoint; Slack Socket Mode event loop
@@ -13,7 +13,7 @@ analytics), then asking a free LLM on **OpenRouter** to answer.
 
 When a user `@mentions` the bot, its message (plus a system prompt and the
 thread's prior history) is sent to the LLM along with two **tool/function
-definitions**: `get_app_store_connect_info` and `get_cloudflare_traffic`. The
+definitions**: `get_app_downloads` and `get_cloudflare_traffic`. The
 model itself decides whether it needs live data and which tool(s) to call.
 The bot executes any requested tool calls, feeds the results back to the
 model, and repeats (up to `maxToolIterations`) until it returns a final
@@ -69,9 +69,10 @@ In Slack, invite the bot to a channel and mention it:
 Then just reply in the thread (no need to @mention again) to continue the conversation.
 
 ## 5. Notes / next steps
-- **ASC sales reports**: the current `appstoreconnect` client only fetches
-  app metadata (`/v1/apps`) as a smoke test. Apple's actual *Sales and Trends
-  Reports* API returns gzipped TSV files
+- **ASC downloads**: `get_app_downloads` queries Apple's *Sales and Trends
+  Reports* API (`/v1/salesReports`, daily SUMMARY, gzipped TSV) for the
+  hardcoded app ID, excluding `3`/`3F` (updates) and `7`/`7F` (in-app purchases)
+  that share the same app ID.
 - **Cloudflare**: currently pulls 7-day request/bytes/threats totals via the
   GraphQL Analytics API for `CF_ZONE_ID`.
 - **Context window**: thread history is trimmed automatically once it
