@@ -6,14 +6,16 @@ context from **App Store Connect** (download trends) and **Cloudflare**
 
 ## Architecture
 - `main.go` — entrypoint; Slack Socket Mode event loop
-- `llm` — OpenRouter chat completions client
+- `llm` — OpenRouter chat completions and embeddings clients
+- `knowledge.go` — Slack knowledge memory: thread chunking, embedding, backfill, vector search
 - `appstoreconnect` — JWT(ES256)-authenticated ASC API client
 - `cloudflare` — Cloudflare GraphQL Analytics client
-- `store` — Postgres-backed thread conversation history
+- `store` — Postgres-backed thread conversation history and pgvector knowledge chunks
 
 When a user `@mentions` the bot, its message (plus a system prompt and the
 thread's prior history) is sent to the LLM along with two **tool/function
-definitions**: `get_app_downloads` and `get_cloudflare_traffic`. The
+definitions**: `get_app_downloads`, `get_cloudflare_traffic` and (when the
+`search_knowledge`. The
 model itself decides whether it needs live data and which tool(s) to call.
 The bot executes any requested tool calls, feeds the results back to the
 model, and repeats (up to `maxToolIterations`) until it returns a final
@@ -38,6 +40,27 @@ answer, which is posted back to Slack **inside a thread**.
   display name so the LLM can tell different people apart in a multi-person
   thread. Display names are resolved via `users.info` and cached in memory.
 
+### Slack knowledge memory (pgvector)
+Semantic search over past Slack discussions. `KNOWLEDGE_CHANNELS` (required)
+is a comma-separated list of channel IDs to index.
+- **Chunking**: one chunk per top-level message plus its replies (a lone
+  message is its own chunk). Bot messages are skipped, and chunks are
+  truncated at 6000 characters.
+- **Embeddings**: OpenRouter `/embeddings`, model set by `EMBEDDING_MODEL`
+  (default `nvidia/nemotron-3-embed-1b:free`, 2048 dims). The model name is
+  stored per row, and search only considers rows from the current model, so
+  switching models requires re-running the backfill.
+- **Storage/search**: `knowledge_chunks` table with an undimensioned
+  `vector` column and cosine distance (`<=>`) search, top 5. There is no ANN
+  index: an exact scan is fine for small corpora. pgvector's HNSW limit is
+  2000 dims for `vector`, so for large corpora index a `halfvec` cast.
+- **Ingestion**: on startup, if `knowledge_chunks` is empty, the bot
+  backfills the full history of the configured channels in the background.
+  To re-backfill (e.g. after changing `EMBEDDING_MODEL`), empty the table
+  (`TRUNCATE knowledge_chunks`) and restart. New messages in those channels
+  are indexed live. Edits and deletions are not handled yet.
+- **Retrieval**: the model calls `search_knowledge(query)` and gets snippets
+  with permalinks.
 
 ## 1. Slack app setup (Socket Mode)
 You said you already have a Slack app — make sure it has:
@@ -50,12 +73,17 @@ You said you already have a Slack app — make sure it has:
 ```bash
 docker compose up -d
 ```
-Starts Postgres on `localhost:5432` (user/pass/db: `slackbot`), matching the
+Starts Postgres (the `pgvector/pgvector:pg16` image, which includes the
+`vector` extension) on `localhost:5432` (user/pass/db: `slackbot`), matching the
 default `DATABASE_URL` in `.env.example`. The bot creates its own schema on
-startup (`db.Migrate`) — no manual migration step needed.
+startup (`db.Migrate` and `db.MigrateKnowledge`) — no manual migration step needed. If you have an old volume created
+from the `postgres:16-alpine` image, recreate it (`docker compose down -v`,
+which deletes stored data): the Debian-based pgvector image uses a different libc.
 
 ## 3. Credentials
-Copy `.env.example` to `.env` and fill in.
+Copy `.env.example` to `.env` and fill in. Set
+`KNOWLEDGE_CHANNELS` and invite the bot to those channels; history is
+backfilled automatically on first start.
 
 ## 4. Run locally
 ```bash

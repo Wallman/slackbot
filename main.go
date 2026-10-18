@@ -53,6 +53,11 @@ func main() {
 		log.Fatalf("failed to migrate postgres schema: %v", err)
 	}
 
+	knowledgeChannels := splitCSV(mustEnv("KNOWLEDGE_CHANNELS"))
+	if err := db.MigrateKnowledge(ctx); err != nil {
+		log.Fatalf("failed to migrate knowledge schema (is pgvector installed?): %v", err)
+	}
+
 	ascClient := appstoreconnect.NewClient(
 		os.Getenv("ASC_ISSUER_ID"),
 		os.Getenv("ASC_KEY_ID"),
@@ -78,7 +83,22 @@ func main() {
 	client := socketmode.New(api)
 	names := newUserNameCache()
 
-	go handleEvents(client, api, llmClient, ascClient, cfClient, db, names, botUserID, maxContextTokens)
+	embedder := llm.NewEmbeddingClient(orKey, envOr("EMBEDDING_MODEL", "nvidia/nemotron-3-embed-1b:free"))
+	indexer := newKnowledgeIndexer(api, db, embedder, names, knowledgeChannels)
+	hasChunks, err := db.HasChunks(ctx)
+	if err != nil {
+		log.Fatalf("failed to check knowledge base: %v", err)
+	}
+	if !hasChunks {
+		log.Println("Knowledge base is empty; backfilling in the background...")
+		go func() {
+			if err := indexer.backfill(ctx); err != nil {
+				log.Printf("[knowledge] backfill failed: %v", err)
+			}
+		}()
+	}
+
+	go handleEvents(client, api, llmClient, ascClient, cfClient, db, indexer, names, botUserID, maxContextTokens)
 
 	log.Println("Starting Slack bot...")
 	if err := client.Run(); err != nil {
@@ -93,6 +113,7 @@ func handleEvents(
 	ascClient *appstoreconnect.Client,
 	cfClient *cloudflare.Client,
 	db *store.Store,
+	indexer *knowledgeIndexer,
 	names *userNameCache,
 	botUserID string,
 	maxContextTokens int,
@@ -117,7 +138,7 @@ func handleEvents(
 					if threadTS == "" {
 						threadTS = ev.TimeStamp // first message in a new thread
 					}
-					go respond(api, llmClient, ascClient, cfClient, db, names, ev.Channel, threadTS, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
+					go respond(api, llmClient, ascClient, cfClient, db, indexer, names, ev.Channel, threadTS, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
 
 				case *slackevents.MessageEvent:
 					// Only consider plain replies inside an existing
@@ -127,6 +148,17 @@ func handleEvents(
 					// same message).
 					if ev.BotID != "" || ev.User == "" || ev.User == botUserID {
 						continue
+					}
+					if indexer.indexes(ev.Channel) && ev.SubType == "" {
+						root := ev.ThreadTimeStamp
+						if root == "" {
+							root = ev.TimeStamp
+						}
+						go func(channel, root string) {
+							if err := indexer.indexThread(context.Background(), channel, root); err != nil {
+								log.Printf("[knowledge] live index %s/%s: %v", channel, root, err)
+							}
+						}(ev.Channel, root)
 					}
 					if ev.ThreadTimeStamp == "" {
 						continue
@@ -145,7 +177,7 @@ func handleEvents(
 						continue
 					}
 					log.Printf("[timing] received threaded reply from user=%s channel=%s thread=%s", ev.User, ev.Channel, ev.ThreadTimeStamp)
-					go respond(api, llmClient, ascClient, cfClient, db, names, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
+					go respond(api, llmClient, ascClient, cfClient, db, indexer, names, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text, receivedAt, maxContextTokens)
 				}
 			}
 		case socketmode.EventTypeConnecting:
@@ -174,6 +206,7 @@ func respond(
 	ascClient *appstoreconnect.Client,
 	cfClient *cloudflare.Client,
 	db *store.Store,
+	indexer *knowledgeIndexer,
 	names *userNameCache,
 	channel, threadTS, msgTS, user, text string,
 	receivedAt time.Time,
@@ -250,7 +283,7 @@ func respond(
 		for _, call := range result.ToolCalls {
 			log.Printf("[tool] calling %s(%s)", call.Function.Name, call.Function.Arguments)
 			toolStart := time.Now()
-			output := executeTool(ascClient, cfClient, call.Function.Name, call.Function.Arguments)
+			output := executeTool(ascClient, cfClient, indexer, call.Function.Name, call.Function.Arguments)
 			log.Printf("[timing] tool %s took %s", call.Function.Name, time.Since(toolStart))
 
 			toolMsg := llm.Message{Role: "tool", ToolCallID: call.ID, Content: output}
@@ -381,10 +414,37 @@ func availableTools() []llm.Tool {
 				},
 			},
 		},
+		{
+			Type: "function",
+			Function: llm.ToolFunction{
+				Name:        "search_knowledge",
+				Description: "Semantic search over all past Slack discussions. Cite the permalinks of results you use.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query": map[string]any{
+							"type":        "string",
+							"description": "What to look for, phrased as a natural-language question or topic.",
+						},
+					},
+					"required": []string{"query"},
+				},
+			},
+		},
 	}
 }
 
-func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client, name, argsJSON string) string {
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client, indexer *knowledgeIndexer, name, argsJSON string) string {
 	switch name {
 	case "get_app_downloads":
 		var args struct {
@@ -419,6 +479,15 @@ func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client,
 			return fmt.Sprintf("error fetching Cloudflare traffic: %v", err)
 		}
 		return truncate(data, 3000)
+
+	case "search_knowledge":
+		var args struct {
+			Query string `json:"query"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || strings.TrimSpace(args.Query) == "" {
+			return "error: query is required"
+		}
+		return truncate(indexer.search(context.Background(), args.Query), 6000)
 
 	default:
 		return fmt.Sprintf("error: unknown tool %q", name)

@@ -208,3 +208,84 @@ func (c *Client) doComplete(ctx context.Context, messages []Message, tools []Too
 	msg := parsed.Choices[0].Message
 	return CompleteResult{Content: msg.Content, ToolCalls: msg.ToolCalls}, false, nil
 }
+
+const openRouterEmbeddingsURL = "https://openrouter.ai/api/v1/embeddings"
+
+// EmbeddingClient talks to OpenRouter's embeddings endpoint.
+type EmbeddingClient struct {
+	APIKey     string
+	Model      string
+	HTTPClient *http.Client
+}
+
+func NewEmbeddingClient(apiKey, model string) *EmbeddingClient {
+	return &EmbeddingClient{
+		APIKey:     apiKey,
+		Model:      model,
+		HTTPClient: &http.Client{Timeout: 60 * time.Second},
+	}
+}
+
+type embeddingRequest struct {
+	Model string   `json:"model"`
+	Input []string `json:"input"`
+}
+
+type embeddingResponse struct {
+	Data []struct {
+		Index     int       `json:"index"`
+		Embedding []float32 `json:"embedding"`
+	} `json:"data"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// Embed returns one vector per input text, in input order.
+func (c *EmbeddingClient) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	body, err := json.Marshal(embeddingRequest{Model: c.Model, Input: texts})
+	if err != nil {
+		return nil, fmt.Errorf("marshal embeddings request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openRouterEmbeddingsURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build embeddings request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("embeddings request: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read embeddings response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("embeddings API returned %d: %s", resp.StatusCode, raw)
+	}
+
+	var parsed embeddingResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("decode embeddings response: %w", err)
+	}
+	if parsed.Error != nil {
+		return nil, fmt.Errorf("embeddings API error: %s", parsed.Error.Message)
+	}
+	if len(parsed.Data) != len(texts) {
+		return nil, fmt.Errorf("embeddings API returned %d vectors for %d inputs", len(parsed.Data), len(texts))
+	}
+	out := make([][]float32, len(texts))
+	for _, d := range parsed.Data {
+		if d.Index < 0 || d.Index >= len(out) {
+			return nil, fmt.Errorf("embeddings API returned invalid index %d", d.Index)
+		}
+		out[d.Index] = d.Embedding
+	}
+	return out, nil
+}

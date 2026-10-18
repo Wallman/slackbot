@@ -1,2 +1,3 @@
-- Use RAG for something suitable
-- CF/ASC MCPs?
+- full text search
+- time-bucket thread indexing
+- change to per-message indexing?
