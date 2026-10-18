@@ -137,12 +137,12 @@ func (k *knowledgeIndexer) backfill(ctx context.Context) error {
 }
 
 // search embeds the query and returns the nearest chunks formatted for the LLM.
-func (k *knowledgeIndexer) search(ctx context.Context, query string) string {
+func (k *knowledgeIndexer) search(ctx context.Context, query, channel, threadTS string) string {
 	vecs, err := k.embedder.Embed(ctx, []string{query})
 	if err != nil {
 		return fmt.Sprintf("error embedding query: %v", err)
 	}
-	results, err := k.db.SearchChunks(ctx, k.embedder.Model, vecs[0], searchResultCap)
+	results, err := k.db.SearchChunks(ctx, k.embedder.Model, vecs[0], searchResultCap, channel, threadTS)
 	if err != nil {
 		return fmt.Sprintf("error searching knowledge base: %v", err)
 	}

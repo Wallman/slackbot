@@ -283,7 +283,7 @@ func respond(
 		for _, call := range result.ToolCalls {
 			log.Printf("[tool] calling %s(%s)", call.Function.Name, call.Function.Arguments)
 			toolStart := time.Now()
-			output := executeTool(ascClient, cfClient, indexer, call.Function.Name, call.Function.Arguments)
+			output := executeTool(ascClient, cfClient, indexer, channel, threadTS, call.Function.Name, call.Function.Arguments)
 			log.Printf("[timing] tool %s took %s", call.Function.Name, time.Since(toolStart))
 
 			toolMsg := llm.Message{Role: "tool", ToolCallID: call.ID, Content: output}
@@ -444,7 +444,7 @@ func splitCSV(s string) []string {
 	return out
 }
 
-func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client, indexer *knowledgeIndexer, name, argsJSON string) string {
+func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client, indexer *knowledgeIndexer, channel, threadTS, name, argsJSON string) string {
 	switch name {
 	case "get_app_downloads":
 		var args struct {
@@ -487,7 +487,7 @@ func executeTool(ascClient *appstoreconnect.Client, cfClient *cloudflare.Client,
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || strings.TrimSpace(args.Query) == "" {
 			return "error: query is required"
 		}
-		return truncate(indexer.search(context.Background(), args.Query), 6000)
+		return truncate(indexer.search(context.Background(), args.Query, channel, threadTS), 6000)
 
 	default:
 		return fmt.Sprintf("error: unknown tool %q", name)

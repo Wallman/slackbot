@@ -85,14 +85,14 @@ func (s *Store) UpsertChunk(ctx context.Context, c Chunk) error {
 
 // SearchChunks returns the limit nearest chunks by cosine distance, only
 // considering chunks embedded with the given model.
-func (s *Store) SearchChunks(ctx context.Context, model string, query []float32, limit int) ([]SearchResult, error) {
+func (s *Store) SearchChunks(ctx context.Context, model string, query []float32, limit int, excludeChannel, excludeThreadTS string) ([]SearchResult, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT channel, text, permalink, created_at, embedding <=> $1::vector AS dist
 		FROM knowledge_chunks
-		WHERE embed_model = $2
+		WHERE embed_model = $2 AND NOT (channel = $4 AND thread_ts = $5)
 		ORDER BY dist
 		LIMIT $3
-	`, vectorLiteral(query), model, limit)
+	`, vectorLiteral(query), model, limit, excludeChannel, excludeThreadTS)
 	if err != nil {
 		return nil, fmt.Errorf("search chunks: %w", err)
 	}
