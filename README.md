@@ -51,7 +51,8 @@ is a comma-separated list of channel IDs to index.
   stored per row, and search only considers rows from the current model, so
   switching models requires re-running the backfill.
 - **Storage/search**: `knowledge_chunks` table with an undimensioned
-  `vector` column and cosine distance (`<=>`) search, top 5. There is no ANN
+  `vector` column and cosine distance (`<=>`) search, top 5, dropping results
+  with distance above `KNOWLEDGE_MAX_DISTANCE` (default 0.6; tune per model). There is no ANN
   index: an exact scan is fine for small corpora. pgvector's HNSW limit is
   2000 dims for `vector`, so for large corpora index a `halfvec` cast.
 - **Ingestion**: on startup, if `knowledge_chunks` is empty, the bot

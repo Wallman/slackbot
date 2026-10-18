@@ -23,19 +23,20 @@ const (
 // Postgres. A chunk is a top-level message plus its replies (or just the
 // message if it has none).
 type knowledgeIndexer struct {
-	api      *slack.Client
-	db       *store.Store
-	embedder *llm.EmbeddingClient
-	names    *userNameCache
-	channels map[string]bool
+	api         *slack.Client
+	db          *store.Store
+	embedder    *llm.EmbeddingClient
+	names       *userNameCache
+	channels    map[string]bool
+	maxDistance float64
 }
 
-func newKnowledgeIndexer(api *slack.Client, db *store.Store, embedder *llm.EmbeddingClient, names *userNameCache, channelIDs []string) *knowledgeIndexer {
+func newKnowledgeIndexer(api *slack.Client, db *store.Store, embedder *llm.EmbeddingClient, names *userNameCache, channelIDs []string, maxDistance float64) *knowledgeIndexer {
 	ch := make(map[string]bool, len(channelIDs))
 	for _, id := range channelIDs {
 		ch[id] = true
 	}
-	return &knowledgeIndexer{api: api, db: db, embedder: embedder, names: names, channels: ch}
+	return &knowledgeIndexer{api: api, db: db, embedder: embedder, names: names, channels: ch, maxDistance: maxDistance}
 }
 
 func (k *knowledgeIndexer) indexes(channel string) bool {
@@ -145,12 +146,17 @@ func (k *knowledgeIndexer) search(ctx context.Context, query string) string {
 	if err != nil {
 		return fmt.Sprintf("error searching knowledge base: %v", err)
 	}
-	if len(results) == 0 {
-		return "No relevant past discussions found."
-	}
 	var b strings.Builder
-	for i, r := range results {
-		fmt.Fprintf(&b, "[%d] %s (%s, distance %.3f)\n%s\n\n", i+1, r.Permalink, r.CreatedAt.Format("2006-01-02"), r.Distance, r.Text)
+	n := 0
+	for _, r := range results {
+		if r.Distance > k.maxDistance {
+			continue
+		}
+		n++
+		fmt.Fprintf(&b, "[%d] %s (%s, distance %.3f)\n%s\n\n", n, r.Permalink, r.CreatedAt.Format("2006-01-02"), r.Distance, r.Text)
+	}
+	if n == 0 {
+		return "No relevant past discussions found."
 	}
 	return b.String()
 }

@@ -84,7 +84,7 @@ func main() {
 	names := newUserNameCache()
 
 	embedder := llm.NewEmbeddingClient(orKey, envOr("EMBEDDING_MODEL", "nvidia/nemotron-3-embed-1b:free"))
-	indexer := newKnowledgeIndexer(api, db, embedder, names, knowledgeChannels)
+	indexer := newKnowledgeIndexer(api, db, embedder, names, knowledgeChannels, envOrFloat("KNOWLEDGE_MAX_DISTANCE", 0.6))
 	hasChunks, err := db.HasChunks(ctx)
 	if err != nil {
 		log.Fatalf("failed to check knowledge base: %v", err)
@@ -514,6 +514,19 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envOrFloat(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Printf("invalid number for %s=%q, using default %v: %v", key, v, fallback, err)
+		return fallback
+	}
+	return f
 }
 
 func envOrInt(key string, fallback int) int {
